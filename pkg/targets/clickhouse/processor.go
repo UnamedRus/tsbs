@@ -1,30 +1,52 @@
 package clickhouse
 
 import (
+	"bytes"
 	"fmt"
-	"github.com/jmoiron/sqlx"
-	"github.com/timescale/tsbs/pkg/targets"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	ch "github.com/ClickHouse/clickhouse-go"
+	"github.com/ClickHouse/clickhouse-go/lib/data"
+	"github.com/jmoiron/sqlx"
+	"github.com/timescale/tsbs/pkg/targets"
 )
 
 // load.Processor interface implementation
 type processor struct {
 	db   *sqlx.DB
-	csi  *syncCSI
+	db2  ch.Clickhouse
+	http http.Client
+	_csi *syncCSI
 	conf *ClickhouseConfig
 }
+
+const (
+	insertTagsSQL = `INSERT INTO tags(%s) VALUES %s ON CONFLICT DO NOTHING RETURNING *`
+	getTagsSQL    = `SELECT * FROM tags`
+	numExtraCols  = 2 // one for json, one for tags_id
+)
 
 // load.Processor interface implementation
 func (p *processor) Init(workerNum int, doLoad, hashWorkers bool) {
 	if doLoad {
 		p.db = sqlx.MustConnect(dbType, getConnectString(p.conf, true))
+		p.db2, _ = ch.OpenDirect(getConnectString(p.conf, true))
+		p.http = http.Client{Transport: &http.Transport{
+			MaxConnsPerHost: 100,
+		}}
+
 		if hashWorkers {
-			p.csi = newSyncCSI()
+			p._csi = newSyncCSI()
 		} else {
-			p.csi = globalSyncCSI
+			p._csi = globalSyncCSI
 		}
 	}
 }
@@ -33,7 +55,79 @@ func (p *processor) Init(workerNum int, doLoad, hashWorkers bool) {
 func (p *processor) Close(doLoad bool) {
 	if doLoad {
 		p.db.Close()
+		p.db2.Close()
 	}
+}
+
+func (p *processor) splitTagsAndMetrics(rows []*insertData, dataCols int, data_as_line bool) ([][]string, [][]interface{}, uint64) {
+	tagRows := make([][]string, 0, len(rows))
+	dataRows := make([][]interface{}, 0, len(rows))
+	numMetrics := uint64(0)
+	commonTagsLen := len(tableCols[tagsKey])
+
+	for _, data := range rows {
+		// Split the tags into individual common tags and an extra bit leftover
+		// for non-common tags that need to be added separately. For each of
+		// the common tags, remove everything before = in the form <label>=<val>
+		// since we won't need it.
+		tags := strings.SplitN(data.tags, ",", commonTagsLen+1)
+		for i := 0; i < commonTagsLen; i++ {
+			tags[i] = strings.Split(tags[i], "=")[1]
+		}
+
+		var json string
+		if len(tags) > commonTagsLen {
+			json = subsystemTagsToJSON(strings.Split(tags[commonTagsLen], ","))
+		}
+
+		metrics := strings.Split(data.fields, ",")
+		numMetrics += uint64(len(metrics) - 1) // 1 field is timestamp
+
+		timestampNano, err := strconv.ParseInt(metrics[0], 10, 64)
+		if err != nil {
+			panic(err)
+		}
+
+		//ts := time.Unix(0, timeInt)
+		if data_as_line {
+			r := make([]interface{}, 0, 1)
+			r[0] = data.fields + "," + json
+			// use nil at 2nd position as placeholder for tagKey
+			dataRows = append(dataRows, r)
+		} else {
+			// use nil at 2-nd position as placeholder for tagKey
+			r := make([]interface{}, 0, dataCols)
+			// First columns in table are
+
+			// tags_id - would be nil for now
+			// additional_tags
+			r = append(r,
+				timestampNano, // unix
+				nil,           // tags_id
+				json)          // additional_tags
+
+			if p.conf.InTableTag {
+				r = append(r, tags[0]) // tags[0] = hostname
+			}
+			for _, v := range metrics[1:] {
+				if v == "" {
+					r = append(r, nil)
+					continue
+				}
+				f64, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					panic(err)
+				}
+				r = append(r, f64)
+			}
+			// use nil at 2nd position as placeholder for tagKey
+			dataRows = append(dataRows, r)
+		}
+
+		tagRows = append(tagRows, tags[:commonTagsLen])
+	}
+
+	return tagRows, dataRows, numMetrics
 }
 
 // load.Processor interface implementation
@@ -78,145 +172,49 @@ type syncCSI struct {
 // therefore all workers need to know about the same map from hostname -> tags_id
 var globalSyncCSI = newSyncCSI()
 
-// Process part of incoming data - insert into tables
-func (p *processor) processCSI(tableName string, rows []*insertData) uint64 {
-	tagRows := make([][]string, 0, len(rows))
-	dataRows := make([][]interface{}, 0, len(rows))
-	ret := uint64(0)
-	commonTagsLen := len(tableCols["tags"])
+func (p *processor) insertHTTP(tableName string, colLen int, dataRows *[][]interface{}, tags_id *[]string) {
 
-	colLen := len(tableCols[tableName]) + 2
+	cols := make([]string, 0, colLen)
+	// First columns would be "created_date", "created_at", "time", "tags_id", "additional_tags"
+	// Inspite of "additional_tags" being added the last one in CREATE TABLE stmt
+	// it goes as a third one here - because we can move columns - they are named
+	// and it is easier to keep variable coumns at the end of the list
+	cols = append(cols, "unix")
 	if p.conf.InTableTag {
-		colLen++
+		cols = append(cols, tableCols["tags"][0]) // hostname
+	}
+	cols = append(cols, tableCols[tableName]...)
+	cols = append(cols, "additional_tags,tags_id")
+
+	sql := fmt.Sprintf(`INSERT INTO %s (%s) FORMAT CSV`, tableName, strings.Join(cols, ","))
+
+	bf := bytes.NewBufferString("")
+
+	for i := 0; i < len(*dataRows); i++ {
+		bf.WriteString((*dataRows)[i][1].(string) + "," + (*tags_id)[i] + ",\n")
 	}
 
-	var tagsIdPosition int = 0
-
-	for _, row := range rows {
-		// Split the tags into individual common tags and
-		// an extra bit leftover for non-common tags that need to be added separately.
-		// For each of the common tags, remove everything after = in the form <label>=<val>
-		// since we won't need it.
-		// tags line ex.:
-		// hostname=host_0,region=eu-west-1,datacenter=eu-west-1b,rack=67,os=Ubuntu16.10,arch=x86,team=NYC,service=7,service_version=0,service_environment=production
-		tags := strings.SplitN(row.tags, ",", commonTagsLen+1)
-		// tags = (
-		//	hostname=host_0
-		//	region=eu-west-1
-		//	datacenter=eu-west-1b
-		// )
-		// extract value of each tag
-		// tags = (
-		//	host_0
-		//	eu-west-1
-		//	eu-west-1b
-		// )
-		for i := 0; i < commonTagsLen; i++ {
-			tags[i] = strings.Split(tags[i], "=")[1]
-		}
-		// prepare JSON for tags that are not common
-		var json interface{} = nil
-		if len(tags) > commonTagsLen {
-			// Join additional tags into JSON string
-			json = subsystemTagsToJSON(strings.Split(tags[commonTagsLen], ","))
-		} else {
-			// No additional tags
-			json = ""
-		}
-
-		// fields line ex.:
-		// 1451606400000000000,58,2,24,61,22,63,6,44,80,38
-		metrics := strings.Split(row.fields, ",")
-
-		// Count number of metrics processed
-		ret += uint64(len(metrics) - 1) // 1-st field is timestamp, do not count it
-		// metrics = (
-		// 	1451606400000000000,
-		// 	58,
-		// )
-
-		// Build string TimeStamp as '2006-01-02 15:04:05.999999 -0700'
-		// convert time from 1451606400000000000 (int64 UNIX TIMESTAMP with nanoseconds)
-		timestampNano, err := strconv.ParseInt(metrics[0], 10, 64)
-		if err != nil {
-			panic(err)
-		}
-		timeUTC := time.Unix(0, timestampNano)
-		TimeUTCStr := timeUTC.Format("2006-01-02 15:04:05.999999 -0700")
-
-		// use nil at 2-nd position as placeholder for tagKey
-		r := make([]interface{}, 0, colLen)
-		// First columns in table are
-		// created_date
-		// created_at
-		// time
-		// tags_id - would be nil for now
-		// additional_tags
-		tagsIdPosition = 3 // what is the position of the tags_id in the row - nil value
-		r = append(r,
-			timeUTC,    // created_date
-			timeUTC,    // created_at
-			TimeUTCStr, // time
-			nil,        // tags_id
-			json)       // additional_tags
-
-		if p.conf.InTableTag {
-			r = append(r, tags[0]) // tags[0] = hostname
-		}
-		for _, v := range metrics[1:] {
-			if v == "" {
-				r = append(r, nil)
-				continue
-			}
-			f64, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				panic(err)
-			}
-			r = append(r, f64)
-		}
-
-		dataRows = append(dataRows, r)
-		tagRows = append(tagRows, tags)
+	var urlx = fmt.Sprintf("http://172.28.77.141:8123?database=benchmark&async_insert=1&wait_for_async_insert=0&query=%s", url.QueryEscape(sql))
+	resp, err := p.http.Post(urlx, "application/octet-stream", bf)
+	if err != nil {
+		panic(err)
 	}
+	io.Copy(ioutil.Discard, resp.Body)
+	resp.Body.Close()
+}
 
-	// Check if any of these tags has yet to be inserted
-	// New tags in this batch, need to be inserted
-	newTags := make([][]string, 0, len(rows))
-	p.csi.mutex.RLock()
-	for _, tagRow := range tagRows {
-		// tagRow contains what was called `tags` earlier - see one screen higher
-		// tagRow[0] = hostname
-		if _, ok := p.csi.m[tagRow[0]]; !ok {
-			// Tags of this hostname are not listed as inserted - new tags line, add it for creation
-			newTags = append(newTags, tagRow)
-		}
-	}
-	p.csi.mutex.RUnlock()
+func (p *processor) insertDefault(tableName string, colLen int, dataRows *[][]interface{}, tags_id *[]int32) {
 
-	// Deal with new tags
-	if len(newTags) > 0 {
-		// We have new tags to insert
-		p.csi.mutex.Lock()
-		hostnameToTags := insertTags(p.conf, p.db, len(p.csi.m), newTags, true)
-		// Insert new tags into map as well
-		for hostName, tagsId := range hostnameToTags {
-			p.csi.m[hostName] = tagsId
-		}
-		p.csi.mutex.Unlock()
-	}
+	tagsIdPosition := 1 // what is the position of the tags_id in the row - nil value
 
-	// Deal with tag ids for each data row
-	p.csi.mutex.RLock()
-	for i := range dataRows {
+	for i := range *dataRows {
 		// tagKey = hostname
-		tagKey := tagRows[i][0]
 		// Insert id of the tag (tags.id) for this host into tags_id position of the dataRows record
 		// refers to
 		// nil,		// tags_id
 
-		dataRows[i][tagsIdPosition] = p.csi.m[tagKey]
+		(*dataRows)[i][tagsIdPosition] = (*tags_id)[i]
 	}
-	p.csi.mutex.RUnlock()
 
 	// Prepare column names
 	cols := make([]string, 0, colLen)
@@ -232,12 +230,12 @@ func (p *processor) processCSI(tableName string, rows []*insertData) uint64 {
 
 	// INSERT statement template
 	sql := fmt.Sprintf(`
-		INSERT INTO %s (
-			%s
-		) VALUES (
-			%s
-		)
-		`,
+			INSERT INTO %s (
+				%s
+			) VALUES (
+				%s
+			)
+			`,
 		tableName,
 		strings.Join(cols, ","),
 		strings.Repeat(",?", len(cols))[1:]) // We need '?,?,?', but repeat ",?" thus we need to chop off 1-st char
@@ -247,7 +245,7 @@ func (p *processor) processCSI(tableName string, rows []*insertData) uint64 {
 	if err != nil {
 		panic(err)
 	}
-	for _, r := range dataRows {
+	for _, r := range *dataRows {
 		_, err := stmt.Exec(r...)
 		if err != nil {
 			panic(err)
@@ -261,14 +259,256 @@ func (p *processor) processCSI(tableName string, rows []*insertData) uint64 {
 	if err != nil {
 		panic(err)
 	}
+}
 
-	return ret
+func (p *processor) insertColumnar(tableName string, colLen int, dataRows *[][]interface{}, tags_id *[]int32) {
+
+	// Prepare column names
+	cols := make([]string, 0, colLen)
+	// First columns would be "created_date", "created_at", "time", "tags_id", "additional_tags"
+	// Inspite of "additional_tags" being added the last one in CREATE TABLE stmt
+	// it goes as a third one here - because we can move columns - they are named
+	// and it is easier to keep variable coumns at the end of the list
+	cols = append(cols, "created_at")
+	if p.conf.InTableTag {
+		cols = append(cols, tableCols["tags"][0]) // hostname
+	}
+	cols = append(cols, tableCols[tableName]...)
+	cols = append(cols, "tags_id")
+
+	// INSERT statement template
+	sql := fmt.Sprintf(`
+				INSERT INTO %s (
+					%s
+				) VALUES (
+					%s
+				)
+				`,
+		tableName,
+		strings.Join(cols, ","),
+		strings.Repeat(",?", len(cols))[1:]) // We need '?,?,?', but repeat ",?" thus we need to chop off 1-st char
+
+	var tx ch.Clickhouse
+	var err error
+
+	tx, err = ch.OpenDirect(getConnectString(p.conf, true))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := tx.Begin(); err == nil {
+		if _, err := tx.Prepare(sql); err == nil {
+			block, err := tx.Block()
+			if err != nil {
+				log.Fatal(err)
+			}
+			writeBatch(block, dataRows, tags_id, []string{"int64", "float64", "float64", "float64", "float64", "float64", "float64", "float64", "float64", "float64", "float64", "tags_id"})
+			err = tx.WriteBlock(block)
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = tx.Commit()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+	err = tx.Close()
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Process part of incoming data - insert into tables
+func (p *processor) processCSI(tableName string, rows []*insertData) uint64 {
+	//tagRows := make([][]string, 0, len(rows))
+	//dataRows := make([][]interface{}, 0, len(rows))
+	//commonTagsLen := len(tableCols["tags"])
+
+	colLen := len(tableCols[tableName]) + numExtraCols
+
+	tagRows, dataRows, numMetrics := p.splitTagsAndMetrics(rows, colLen, true)
+
+	// Check if any of these tags has yet to be inserted
+	newTags := make([][]string, 0, len(rows))
+
+	tags_id := make([]string, 0, len(rows))
+	tags_id_int := make([]int32, 0, len(rows))
+
+	p._csi.mutex.RLock()
+	for _, cols := range tagRows {
+		if _, ok := p._csi.m[cols[0]]; !ok {
+			newTags = append(newTags, cols)
+		}
+	}
+	p._csi.mutex.RUnlock()
+	if len(newTags) > 0 {
+		p._csi.mutex.Lock()
+		res := p.insertTags(p.conf, p.db, len(p._csi.m), newTags, true)
+		for k, v := range res {
+			p._csi.m[k] = v
+		}
+		p._csi.mutex.Unlock()
+	}
+
+	p._csi.mutex.RLock()
+	for i := range tagRows {
+		tagKey := tagRows[i][0]
+		tags_id = append(tags_id, strconv.FormatInt(p._csi.m[tagKey], 10))
+		tags_id_int = append(tags_id_int, int32(p._csi.m[tagKey]))
+
+	}
+	p._csi.mutex.RUnlock()
+
+	if p.conf.InTableTag {
+		colLen++
+	}
+
+	if true {
+		p.insertHTTP(tableName, colLen, &dataRows, &tags_id)
+	} else if false {
+		p.insertColumnar(tableName, colLen, &dataRows, &tags_id_int)
+	} else if false {
+		p.insertDefault(tableName, colLen, &dataRows, &tags_id_int)
+	}
+
+	// var tagsIdPosition int = 0
+	/*
+		for _, row := range rows {
+			// Split the tags into individual common tags and
+			// an extra bit leftover for non-common tags that need to be added separately.
+			// For each of the common tags, remove everything after = in the form <label>=<val>
+			// since we won't need it.
+			// tags line ex.:
+			// hostname=host_0,region=eu-west-1,datacenter=eu-west-1b,rack=67,os=Ubuntu16.10,arch=x86,team=NYC,service=7,service_version=0,service_environment=production
+			tags := strings.SplitN(row.tags, ",", commonTagsLen+1)
+			// tags = (
+			//	hostname=host_0
+			//	region=eu-west-1
+			//	datacenter=eu-west-1b
+			// )
+			// extract value of each tag
+			// tags = (
+			//	host_0
+			//	eu-west-1
+			//	eu-west-1b
+			// )
+			for i := 0; i < commonTagsLen; i++ {
+				tags[i] = strings.Split(tags[i], "=")[1]
+			}
+			// prepare JSON for tags that are not common
+			var json interface{} = nil
+			if len(tags) > commonTagsLen {
+				// Join additional tags into JSON string
+				json = subsystemTagsToJSON(strings.Split(tags[commonTagsLen], ","))
+			} else {
+				// No additional tags
+				json = ""
+			}
+
+			// fields line ex.:
+			// 1451606400000000000,58,2,24,61,22,63,6,44,80,38
+			metrics := strings.Split(row.fields, ",")
+
+			// Count number of metrics processed
+			ret += uint64(len(metrics) - 1) // 1-st field is timestamp, do not count it
+			// metrics = (
+			// 	1451606400000000000,
+			// 	58,
+			// )
+
+			// Build string TimeStamp as '2006-01-02 15:04:05.999999 -0700'
+			// convert time from 1451606400000000000 (int64 UNIX TIMESTAMP with nanoseconds)
+			timestampNano, err := strconv.ParseInt(metrics[0], 10, 64)
+			if err != nil {
+				panic(err)
+			}
+			timeUTC := time.Unix(0, timestampNano)
+			TimeUTCStr := timeUTC.Format("2006-01-02 15:04:05.999999 -0700")
+
+			// use nil at 2-nd position as placeholder for tagKey
+			r := make([]interface{}, 0, colLen)
+			// First columns in table are
+			// created_date
+			// created_at
+			// time
+			// tags_id - would be nil for now
+			// additional_tags
+			// tagsIdPosition = 3 // what is the position of the tags_id in the row - nil value
+			r = append(r,
+				timeUTC,    // created_date
+				timeUTC,    // created_at
+				TimeUTCStr, // time
+				nil,        // tags_id
+				json)       // additional_tags
+
+			if p.conf.InTableTag {
+				r = append(r, tags[0]) // tags[0] = hostname
+			}
+			for _, v := range metrics[1:] {
+				if v == "" {
+					r = append(r, nil)
+					continue
+				}
+				f64, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					panic(err)
+				}
+				r = append(r, f64)
+			}
+
+			dataRows = append(dataRows, r)
+			tagRows = append(tagRows, tags)
+		}
+
+		// Check if any of these tags has yet to be inserted
+		// New tags in this batch, need to be inserted
+		newTags := make([][]string, 0, len(rows))
+		p.csi.mutex.RLock()
+		for _, tagRow := range tagRows {
+			// tagRow contains what was called `tags` earlier - see one screen higher
+			// tagRow[0] = hostname
+			if _, ok := p.csi.m[tagRow[0]]; !ok {
+				// Tags of this hostname are not listed as inserted - new tags line, add it for creation
+				newTags = append(newTags, tagRow)
+			}
+		}
+		p.csi.mutex.RUnlock()
+
+		// Deal with new tags
+		if len(newTags) > 0 {
+			// We have new tags to insert
+			p.csi.mutex.Lock()
+			hostnameToTags := insertTags(p.conf, p.db, len(p.csi.m), newTags, true)
+			// Insert new tags into map as well
+			for hostName, tagsId := range hostnameToTags {
+				p.csi.m[hostName] = tagsId
+			}
+			p.csi.mutex.Unlock()
+		}
+
+		tags_id := make([]int32, 0, len(rows))
+
+		// Deal with tag ids for each data row
+		p.csi.mutex.RLock()
+		for i := range dataRows {
+			// tagKey = hostname
+			tagKey := tagRows[i][0]
+			// Insert id of the tag (tags.id) for this host into tags_id position of the dataRows record
+			// refers to
+			// nil,		// tags_id
+			tags_id = append(tags_id, int32(p.csi.m[tagKey]))
+		}
+		p.csi.mutex.RUnlock()
+	*/
+
+	return numMetrics
 }
 
 // insertTags fills tags table with values
-func insertTags(conf *ClickhouseConfig, db *sqlx.DB, startID int, rows [][]string, returnResults bool) map[string]int64 {
+func (p *processor) insertTags(conf *ClickhouseConfig, db *sqlx.DB, startID int, rows [][]string, returnResults bool) map[string]int64 {
 	// Map hostname to tags_id
-	ret := make(map[string]int64)
+	res := make(map[string]int64)
 
 	// reflect tags table structure which is
 	// CREATE TABLE tags(
@@ -341,7 +581,7 @@ func insertTags(conf *ClickhouseConfig, db *sqlx.DB, startID int, rows [][]strin
 		// Fill map hostname -> id
 		if returnResults {
 			// Map hostname -> tags_id
-			ret[row[0]] = int64(id)
+			res[row[0]] = int64(id)
 		}
 	}
 
@@ -350,11 +590,52 @@ func insertTags(conf *ClickhouseConfig, db *sqlx.DB, startID int, rows [][]strin
 		panic(err)
 	}
 
-	if returnResults {
-		return ret
-	}
+	return res
+}
 
-	return nil
+func writeBatch(block *data.Block, rows *[][]interface{}, tags_id *[]int32, types []string) {
+	block.Reserve()
+	n := len((*rows))
+	block.NumRows += uint64(n)
+
+	for i := 0; i < n; i++ {
+		split_string := strings.Split((*rows)[i], ",")
+
+		for m := 0; m < len(types); m++ {
+			switch types[m] {
+			case "tags_id":
+				block.WriteInt32(m, (*tags_id)[i])
+			case "string":
+				block.WriteString(m, split_string[m])
+			case "float32":
+				f, err := strconv.ParseFloat(split_string[m], 32)
+				if err != nil {
+					panic(fmt.Sprintf("could not parse '%s' to float32", split_string[m]))
+				}
+				block.WriteFloat32(m, float32(f))
+			case "float64":
+				f, err := strconv.ParseFloat(split_string[m], 64)
+				if err != nil {
+					panic(fmt.Sprintf("could not parse '%s' to float64", split_string[m]))
+				}
+				block.WriteFloat64Nullable(m, &f)
+			case "int64":
+				i, err := strconv.ParseInt(split_string[m], 10, 64)
+				if err != nil {
+					panic(fmt.Sprintf("could not parse '%s' to int64", split_string[m]))
+				}
+				block.WriteInt64(m, i)
+			case "int32":
+				i, err := strconv.ParseInt(split_string[m], 10, 32)
+				if err != nil {
+					panic(fmt.Sprintf("could not parse '%s' to int32", split_string[m]))
+				}
+				block.WriteInt32(m, int32(i))
+			default:
+				panic(fmt.Sprintf("unrecognized type %s", types[m]))
+			}
+		}
+	}
 }
 
 func convertBasedOnType(serializedType, value string) interface{} {

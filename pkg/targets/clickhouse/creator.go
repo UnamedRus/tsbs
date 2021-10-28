@@ -4,10 +4,14 @@ import (
 	"fmt"
 	"strings"
 
+	_ "github.com/ClickHouse/clickhouse-go"
 	"github.com/jmoiron/sqlx"
-	_ "github.com/kshvakov/clickhouse"
 	"github.com/timescale/tsbs/pkg/data/usecases/common"
 	"github.com/timescale/tsbs/pkg/targets"
+)
+
+const (
+	tagsKey = "tags"
 )
 
 // loader.DBCreator interface implementation
@@ -137,13 +141,13 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 
 	sql := fmt.Sprintf(`
 			CREATE TABLE %s (
-				created_date    Date     DEFAULT today(),
-				created_at      DateTime DEFAULT now(),
-				time            String,
+				unix			Int64,
+				created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix),
+
 				tags_id         UInt32,
 				%s,
 				additional_tags String   DEFAULT ''
-			) ENGINE = MergeTree(created_date, (tags_id, created_at), 8192)
+			) ENGINE = MergeTree PARTITION BY toYYYYMM(created_at) ORDER BY (toDate(created_at), tags_id, created_at)
 			`,
 		tableName,
 		strings.Join(columnsWithType, ","))
