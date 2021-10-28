@@ -15,13 +15,13 @@ DATABASE_PASSWORD=${DATABASE_PASSWORD:-""}
 # Load parameters - personal
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-10s}
 HASH_WORKERS=${HASH_WORKERS:-false}
-
+BATCH_SIZE=${BATCH_SIZE:-100}
+NUM_WORKERS=${NUM_WORKERS:-8}
 EXE_DIR=${EXE_DIR:-$(dirname $0)}
 source ${EXE_DIR}/load_common.sh
 
 cat ${DATA_FILE} | gunzip | $EXE_FILE_NAME \
                                 --host=${DATABASE_HOST} \
-                                --port=${DATABASE_PORT} \
                                 --user=${DATABASE_USER} \
                                 --password=${DATABASE_PASSWORD} \
                                 --db-name=${DATABASE_NAME} \
