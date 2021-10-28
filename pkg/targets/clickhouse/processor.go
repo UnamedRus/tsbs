@@ -599,38 +599,21 @@ func writeBatch(block *data.Block, rows *[][]interface{}, tags_id *[]int32, type
 	block.NumRows += uint64(n)
 
 	for i := 0; i < n; i++ {
-		split_string := strings.Split((*rows)[i], ",")
 
 		for m := 0; m < len(types); m++ {
 			switch types[m] {
 			case "tags_id":
 				block.WriteInt32(m, (*tags_id)[i])
 			case "string":
-				block.WriteString(m, split_string[m])
+				block.WriteString(m, (*rows)[i][m].(string))
 			case "float32":
-				f, err := strconv.ParseFloat(split_string[m], 32)
-				if err != nil {
-					panic(fmt.Sprintf("could not parse '%s' to float32", split_string[m]))
-				}
-				block.WriteFloat32(m, float32(f))
+				block.WriteFloat32(m, (*rows)[i][m].(float32))
 			case "float64":
-				f, err := strconv.ParseFloat(split_string[m], 64)
-				if err != nil {
-					panic(fmt.Sprintf("could not parse '%s' to float64", split_string[m]))
-				}
-				block.WriteFloat64Nullable(m, &f)
+				block.WriteFloat64Nullable(m, (*rows)[i][m].(*float64))
 			case "int64":
-				i, err := strconv.ParseInt(split_string[m], 10, 64)
-				if err != nil {
-					panic(fmt.Sprintf("could not parse '%s' to int64", split_string[m]))
-				}
-				block.WriteInt64(m, i)
+				block.WriteInt64(m, (*rows)[i][m].(int64))
 			case "int32":
-				i, err := strconv.ParseInt(split_string[m], 10, 32)
-				if err != nil {
-					panic(fmt.Sprintf("could not parse '%s' to int32", split_string[m]))
-				}
-				block.WriteInt32(m, int32(i))
+				block.WriteInt32(m, (*rows)[i][m].(int32))
 			default:
 				panic(fmt.Sprintf("unrecognized type %s", types[m]))
 			}
