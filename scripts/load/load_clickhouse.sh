@@ -13,6 +13,10 @@ DATABASE_USER=${DATABASE_USER:-default}
 DATABASE_PASSWORD=${DATABASE_PASSWORD:-""}
 DATABASE_PORT=${DATABASE_PORT:-9000}
 INSERT_TYPE=${INSERT_TYPE:-Default}
+USE_PROJECTIONS=${USE_PROJECTIONS:-false}
+USE_DAILY_PARTITIONING=${USE_DAILY_PARTITIONING:-false}
+USE_NULL_TABLE=${USE_NULL_TABLE:-false}
+METRIC_LZ4HC=${METRIC_LZ4HC:-0}
 
 # Load parameters - personal
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-10s}
@@ -33,3 +37,7 @@ cat ${DATA_FILE} | gunzip | $EXE_FILE_NAME \
                                 --workers=${NUM_WORKERS} \
                                 --reporting-period=${PROGRESS_INTERVAL} \
                                 --hash-workers=${HASH_WORKERS}
+                                --use-daily-partitioning=${USE_DAILY_PARTITIONING}
+                                --use_projections=${USE_PROJECTIONS}
+                                --use_null_table=${USE_NULL_TABLE}
+                                --metric_lz4hc={$METRIC_LZ4HC}
