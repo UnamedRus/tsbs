@@ -126,6 +126,34 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 		columnNames = append(columnNames, partitioningColumn)
 	}
 
+	var partitioningExpression = "toYYYYMM(created_at)"
+
+	var metricsCodec = ""
+
+	var projection = ""
+
+	if conf.MetricLZ4HC > 0 {
+		metricsCodec = fmt.Sprintf("CODEC(LZ4HC(%s))", conf.MetricLZ4HC)
+	}
+
+	if conf.DailyPartitioning {
+		partitioningExpression = "toDate(created_at)"
+	}
+
+	if conf.UseProjections {
+		projection = fmt.Sprintf(`
+			PROJECTION last_point
+			(
+				SELECT
+					tags_id,
+					any(additional_tags),
+					COLUMNS('created_at|time|created_date') APPLY max,
+					COLUMNS('usage') APPLY metric -> argMax(metric, created_at)
+				GROUP BY tags_id
+			),
+		`)
+	}
+
 	// Add all column names from fieldColumns into columnNames
 	columnNames = append(columnNames, fieldColumns...)
 
@@ -136,21 +164,38 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 			// Skip nameless columns
 			continue
 		}
-		columnsWithType = append(columnsWithType, fmt.Sprintf("%s Nullable(Float64)", column))
+		columnsWithType = append(columnsWithType, fmt.Sprintf("%s Nullable(Float64) %s", column, metricsCodec))
 	}
 
-	sql := fmt.Sprintf(`
+	var sql string
+	if true {
+		sql = fmt.Sprintf(`
 			CREATE TABLE %s (
-				unix			Int64,
-				created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix),
-
-				tags_id         UInt32,
+				unix			Int64 CODEC(Delta,LZ4),
+				created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix) CODEC(Delta,LZ4),
+				tags_id         Int32,
 				%s,
+				%s
 				additional_tags String   DEFAULT ''
-			) ENGINE = MergeTree PARTITION BY toYYYYMM(created_at) ORDER BY (toDate(created_at), tags_id, created_at)
+			) ENGINE = MergeTree PARTITION BY %s ORDER BY (tags_id, created_at) SETTINGS min_rows_for_compact_part=100000
 			`,
-		tableName,
-		strings.Join(columnsWithType, ","))
+			tableName,
+			strings.Join(columnsWithType, ","),
+			projection,
+			partitioningExpression)
+	} else {
+		sql = fmt.Sprintf(`
+		CREATE TABLE %s (
+			unix			Int64 CODEC(Delta,LZ4),
+			created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix) CODEC(Delta,LZ4),
+			tags_id         Int32,
+			%s,
+			additional_tags String   DEFAULT ''
+		) ENGINE = Null()
+		`,
+			tableName,
+			strings.Join(columnsWithType, ","))
+	}
 	if conf.Debug > 0 {
 		fmt.Printf(sql)
 	}
@@ -184,7 +229,7 @@ func generateTagsTableQuery(tagNames, tagTypes []string) string {
 			"created_at   DateTime DEFAULT now(),\n"+
 			"id           UInt32,\n"+
 			"%s"+
-			") ENGINE = MergeTree(created_date, (%s), 8192)",
+			") ENGINE = MergeTree() ORDER BY (%s)",
 		cols,
 		index)
 }

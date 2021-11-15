@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+
 	"github.com/blagojts/viper"
 	"github.com/spf13/pflag"
 	"github.com/timescale/tsbs/internal/utils"
@@ -40,12 +41,17 @@ func init() {
 		panic(fmt.Errorf("unable to decode config: %s", err))
 	}
 	conf = &clickhouse.ClickhouseConfig{
-		Host:       viper.GetString("host"),
-		User:       viper.GetString("user"),
-		Password:   viper.GetString("password"),
-		LogBatches: viper.GetBool("log-batches"),
-		Debug:      viper.GetInt("debug"),
-		DbName:     loaderConf.DBName,
+		Host:              viper.GetString("host"),
+		User:              viper.GetString("user"),
+		Port:              viper.GetString("port"),
+		InsertType:        viper.GetString("insert-type"),
+		Password:          viper.GetString("password"),
+		LogBatches:        viper.GetBool("log-batches"),
+		DailyPartitioning: viper.GetBool("daily-partitioning"),
+		MetricLZ4HC:       viper.GetInt("metric-lz4hc"),
+		UseProjections:    viper.GetBool("use-projections"),
+		Debug:             viper.GetInt("debug"),
+		DbName:            loaderConf.DBName,
 	}
 
 	loader = load.GetBenchmarkRunner(loaderConf)
