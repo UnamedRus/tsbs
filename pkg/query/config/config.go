@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+
 	"github.com/spf13/pflag"
 	"github.com/timescale/tsbs/internal/utils"
 	"github.com/timescale/tsbs/pkg/data/usecases/common"
@@ -25,7 +26,8 @@ type QueryGeneratorConfig struct {
 	TimescaleUseTags       bool `mapstructure:"timescale-use-tags"`
 	TimescaleUseTimeBucket bool `mapstructure:"timescale-use-time-bucket"`
 
-	ClickhouseUseTags bool `mapstructure:"clickhouse-use-tags"`
+	ClickhouseUseTags        bool `mapstructure:"clickhouse-use-tags"`
+	ClickHouseUseProjections bool `mapstructure:"clickhouse-use-projections"`
 
 	MongoUseNaive bool   `mapstructure:"mongo-use-native"`
 	DbName        string `mapstructure:"db-name"`
@@ -57,6 +59,7 @@ func (c *QueryGeneratorConfig) AddToFlagSet(fs *pflag.FlagSet) {
 		"The number of round-robin serialization groups. Use this to scale up data generation to multiple processes.")
 
 	fs.Bool("clickhouse-use-tags", true, "ClickHouse only: Use separate tags table when querying")
+	fs.Bool("clickhouse-use-projections", false, "ClickHouse only: Use projection optimized queries when querying")
 	fs.Bool("mongo-use-naive", true, "MongoDB only: Generate queries for the 'naive' data storage format for Mongo")
 	fs.Bool("timescale-use-json", false, "TimescaleDB only: Use separate JSON tags table when querying")
 	fs.Bool("timescale-use-tags", true, "TimescaleDB only: Use separate tags table when querying")

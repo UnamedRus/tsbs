@@ -248,26 +248,45 @@ func (d *Devops) HighCPUForHosts(qi query.Query, nHosts int) {
 func (d *Devops) LastPointPerHost(qi query.Query) {
 	var sql string
 	if d.UseTags {
-		sql = fmt.Sprintf(`
-            SELECT *
-            FROM
-            (
-                SELECT *
-                FROM cpu
-                WHERE (tags_id, created_at) IN
-                (
-                    SELECT
-                        tags_id,
-                        max(created_at)
-                    FROM cpu
-                    GROUP BY tags_id
-                )
-            ) AS c
-            ANY INNER JOIN tags AS t ON c.tags_id = t.id
-            ORDER BY
-                t.hostname ASC,
-                c.time DESC
-            `)
+		if d.UseProjections {
+			sql = fmt.Sprintf(`
+				SELECT *
+				FROM 
+				(	
+					SELECT 
+						tags_id, 
+						any(additional_tags), 
+						COLUMNS('created_at|created_date|time') APPLY max,
+						COLUMNS('usage') APPLY metric->argMax(metric,created_at)
+					FROM cpu 
+					GROUP BY tags_id
+				) AS c
+				ANY INNER JOIN tags AS t ON c.tags_id = t.id
+        	    ORDER BY
+        	        t.hostname ASC
+				SETTINGS allow_experimental_projection_optimization = 1
+			`)
+		} else {
+			sql = fmt.Sprintf(`
+        	    SELECT *
+        	    FROM
+        	    (
+        	        SELECT *
+        	        FROM cpu
+        	        WHERE (tags_id, created_at) IN
+        	        (
+        	            SELECT
+        	                tags_id,
+        	                max(created_at)
+        	            FROM cpu
+        	            GROUP BY tags_id
+        	        )
+        	    ) AS c
+        	    ANY INNER JOIN tags AS t ON c.tags_id = t.id
+        	    ORDER BY
+        	        t.hostname ASC
+        	    `)
+		}
 	} else {
 		sql = fmt.Sprintf(`
             SELECT DISTINCT(hostname), *

@@ -20,7 +20,8 @@ func InitQueryFactories(config *config.QueryGeneratorConfig) map[string]interfac
 	factories := make(map[string]interface{})
 	factories[constants.FormatCassandra] = &cassandra.BaseGenerator{}
 	factories[constants.FormatClickhouse] = &clickhouse.BaseGenerator{
-		UseTags: config.ClickhouseUseTags,
+		UseTags:        config.ClickhouseUseTags,
+		UseProjections: config.ClickHouseUseProjections,
 	}
 	factories[constants.FormatCrateDB] = &cratedb.BaseGenerator{}
 	factories[constants.FormatInflux] = &influx.BaseGenerator{}

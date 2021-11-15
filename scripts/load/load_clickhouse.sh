@@ -11,20 +11,24 @@ fi
 DATA_FILE_NAME=${DATA_FILE_NAME:-clickhouse-data.gz}
 DATABASE_USER=${DATABASE_USER:-default}
 DATABASE_PASSWORD=${DATABASE_PASSWORD:-""}
+DATABASE_PORT=${DATABASE_PORT:-9000}
+INSERT_TYPE=${INSERT_TYPE:-Default}
 
 # Load parameters - personal
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-10s}
 HASH_WORKERS=${HASH_WORKERS:-false}
 BATCH_SIZE=${BATCH_SIZE:-100}
-NUM_WORKERS=${NUM_WORKERS:-8}
+NUM_WORKERS=${NUM_WORKERS:-16}
 EXE_DIR=${EXE_DIR:-$(dirname $0)}
 source ${EXE_DIR}/load_common.sh
 
 cat ${DATA_FILE} | gunzip | $EXE_FILE_NAME \
                                 --host=${DATABASE_HOST} \
                                 --user=${DATABASE_USER} \
+                                --port=${DATABASE_PORT} \
                                 --password=${DATABASE_PASSWORD} \
                                 --db-name=${DATABASE_NAME} \
+                                --insert-type=${INSERT_TYPE} \
                                 --batch-size=${BATCH_SIZE} \
                                 --workers=${NUM_WORKERS} \
                                 --reporting-period=${PROGRESS_INTERVAL} \
