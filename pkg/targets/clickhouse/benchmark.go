@@ -24,6 +24,7 @@ type ClickhouseConfig struct {
 	MetricLZ4HC       int
 	DailyPartitioning bool
 	UseProjections    bool
+	UseNullTable      bool
 
 	Debug  int
 	DbName string

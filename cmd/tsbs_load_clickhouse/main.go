@@ -47,10 +47,11 @@ func init() {
 		InsertType:        viper.GetString("insert-type"),
 		Password:          viper.GetString("password"),
 		LogBatches:        viper.GetBool("log-batches"),
-		DailyPartitioning: viper.GetBool("daily-partitioning"),
+		DailyPartitioning: viper.GetBool("use-daily-partitioning"),
 		MetricLZ4HC:       viper.GetInt("metric-lz4hc"),
 		UseProjections:    viper.GetBool("use-projections"),
 		Debug:             viper.GetInt("debug"),
+		UseNullTable:      viper.GetBool("use-null-table"),
 		DbName:            loaderConf.DBName,
 	}
 

@@ -29,12 +29,13 @@ func (c clickhouseTarget) TargetSpecificFlags(flagPrefix string, flagSet *pflag.
 	flagSet.String(flagPrefix+"user", "default", "User to connect to ClickHouse as")
 	flagSet.String(flagPrefix+"port", "9000", "Port of ClickHouse instance")
 	flagSet.String(flagPrefix+"insert-type", "Default", "Type of Insert Strategy")
-	flagSet.Bool(flagPrefix+"daily-partitioning", false, "Partition table by days")
-	flagSet.Int(flagPrefix+"metricLZ4HC", 0, "Use CODEC(LZ4CH) for metrics. (default 0 mean use default LZ4)")
+	flagSet.Bool(flagPrefix+"use-daily-partitioning", false, "Use table partitioning by days")
+	flagSet.Int(flagPrefix+"metric-lz4hc", 0, "Use CODEC(LZ4CH) for metrics. (default 0 mean use default LZ4)")
 	flagSet.String(flagPrefix+"password", "", "Password to connect to ClickHouse")
 	flagSet.Bool(flagPrefix+"log-batches", false, "Whether to time individual batches.")
 	flagSet.Int(flagPrefix+"debug", 0, "Debug printing (choices: 0, 1, 2). (default 0)")
 	flagSet.Bool(flagPrefix+"use-projections", false, "Use projections for tables. (default false)")
+	flagSet.Bool(flagPrefix+"use-null-table", false, "Use Null table engine. (default false)")
 }
 
 func (c clickhouseTarget) TargetName() string {

@@ -140,6 +140,12 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 		partitioningExpression = "toDate(created_at)"
 	}
 
+	tableEngine := fmt.Sprintf(`ENGINE = MergeTree PARTITION BY %s ORDER BY (tags_id, created_at) SETTINGS min_rows_for_compact_part=100000`, partitioningExpression)
+
+	if conf.UseNullTable {
+		tableEngine = "Null"
+	}
+
 	if conf.UseProjections {
 		projection = fmt.Sprintf(`
 			PROJECTION last_point
@@ -167,9 +173,7 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 		columnsWithType = append(columnsWithType, fmt.Sprintf("%s Nullable(Float64) %s", column, metricsCodec))
 	}
 
-	var sql string
-	if true {
-		sql = fmt.Sprintf(`
+	sql := fmt.Sprintf(`
 			CREATE TABLE %s (
 				unix			Int64 CODEC(Delta,LZ4),
 				created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix) CODEC(Delta,LZ4),
@@ -177,25 +181,13 @@ func createMetricsTable(conf *ClickhouseConfig, db *sqlx.DB, tableName string, f
 				%s,
 				%s
 				additional_tags String   DEFAULT ''
-			) ENGINE = MergeTree PARTITION BY %s ORDER BY (tags_id, created_at) SETTINGS min_rows_for_compact_part=100000
+			) %s
 			`,
-			tableName,
-			strings.Join(columnsWithType, ","),
-			projection,
-			partitioningExpression)
-	} else {
-		sql = fmt.Sprintf(`
-		CREATE TABLE %s (
-			unix			Int64 CODEC(Delta,LZ4),
-			created_at      DateTime DEFAULT fromUnixTimestamp64Nano(unix) CODEC(Delta,LZ4),
-			tags_id         Int32,
-			%s,
-			additional_tags String   DEFAULT ''
-		) ENGINE = Null()
-		`,
-			tableName,
-			strings.Join(columnsWithType, ","))
-	}
+		tableName,
+		strings.Join(columnsWithType, ","),
+		projection,
+		tableEngine)
+
 	if conf.Debug > 0 {
 		fmt.Printf(sql)
 	}
